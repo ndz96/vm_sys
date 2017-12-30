@@ -38,12 +38,13 @@ public:
 	Status disconnectSharedSegment(const char* name);
 	Status deleteSharedSegment(const char* name);
 private:
-	///TO DO
 	std::recursive_mutex* mtx;
 	KernelSystem* sys;
 	PMTAllocator* pmt_alloc;
 	Partition* partition;
 	PMT* pmt;
 	unsigned id;
+	std::vector<std::pair<VirtualAddress, std::string>> sharedSegs;
+
 	friend KernelSystem;
 };

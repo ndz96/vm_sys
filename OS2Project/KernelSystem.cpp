@@ -77,6 +77,22 @@ Status KernelSystem::access(ProcessId pid, VirtualAddress address, AccessType ty
 	if (type == AccessType::EXECUTE && !desc->x)
 		return Status::TRAP;
 
+	//if cloned propagate to cloned descriptor
+	if (desc->cloned) {
+		desc = &(desc->un.clonedDesc->desc);
+		desc->ref_thrash = 1;
+		desc->ref_clock = 1;
+		if (type == AccessType::WRITE || type == AccessType::READ_WRITE) {
+			//apply CoW optimization
+			apply_cow = true;
+			desc->dirty = 1;
+			return Status::PAGE_FAULT;
+		}
+		if (!desc->valid)
+			return Status::PAGE_FAULT;
+		return Status::OK;
+	}
+
 	//if shared propagate to hidden process
 	if (desc->shared)
 		desc = desc->un.hiddenDesc;
@@ -102,13 +118,83 @@ Process* KernelSystem::cloneProcess(ProcessId pid)
 	if (pid < 0 || pid >= processes.size() || !processes[pid].second)
 		return nullptr;
 
-	/*Process* p = createProcess();
-	ProcessId id = p->getProcessId();*/
+	//create new process
+	Process* newProc = createProcess();
 
+	//for each segment
+	for (size_t i = 0; i < pmt_alloc->segments[pid].size(); ++i) {
+		PageNum pgStart = pmt_alloc->segments[pid][i].first;
+		PageNum pgEnd = pmt_alloc->segments[pid][i].second;
 
+		bool sharedSegExists = false;
+		//check if segment is *shared* -> connect new process
+		for (size_t i = 0; i < processes[pid].first->sharedSegs.size(); ++i) {
+			if (processes[pid].first->sharedSegs[i].first == (pgStart << PAGE_BITS)) {
+				//seg is shared
+				sharedSegExists = true;
+				std::string name = processes[pid].first->sharedSegs[i].second;
+				AccessType type = sharedFlags[name];
+				//connect it to shared segment
+				if (newProc->createSharedSegment((pgStart << PAGE_BITS),
+					pgEnd - pgStart + 1, name.c_str(), type) != Status::OK) {
+						delete newProc;
+						return nullptr;
+					}
+				break;
+			}
+		}
 
+		if (sharedSegExists)
+			continue; //no need to inspect this seg anymore
 
-	return nullptr;
+		AccessType atype;
+		//for each page in *standard* segment
+		PMT* pmt = getPMT(pid);
+		for (PageNum pg = pgStart; pg <= pgEnd; ++pg) {
+			Descriptor* desc = pmt_alloc->getDescriptor(pmt, pg);
+			if (pg == pgStart) {
+				//get segment atype
+				if (desc->r && desc->w)
+					atype = READ_WRITE;
+				else if (desc->r)
+					atype = READ;
+				else if (desc->w)
+					atype = WRITE;
+				else atype = EXECUTE;
+			}
+			if (!desc->cloned) {
+				///first time cloned page - new cloned descriptor for it
+				ClonedDescriptor* cdesc = pmt_alloc->getFreeClonedDescriptor();
+				if (cdesc == nullptr) {
+					delete newProc;
+					return nullptr;
+				}
+				cdesc->numSharing++;
+
+				//copy descriptor to cloned one
+				cdesc->desc = *desc;
+				cdesc->desc.un.cluster = desc->un.cluster; //just in case for union copyc
+
+				//update frame to point to cloned one
+				if (desc->valid)
+					frames[desc->frame].myDesc = &(cdesc->desc);
+
+				//update this one to point to cloned one
+				desc->cloned = 1;
+				desc->un.clonedDesc = cdesc;
+			}
+		}
+
+		//now all are pages in this segment are *cloned* ones
+		//->allocate *cloned* segment for new process
+		if (pmt_alloc->allocateSegment(newProc->getProcessId(), pgStart << PAGE_BITS, pgEnd - pgStart + 1,
+			atype, 0, 1, pid, 0) != Status::OK) {
+			delete newProc;
+			return nullptr;
+		}
+	}
+	//all fine
+	return newProc;
 }
 
 Status KernelSystem::eraseSharedSegId(std::string name, ProcessId id)
@@ -123,7 +209,13 @@ Status KernelSystem::eraseSharedSegId(std::string name, ProcessId id)
 			//delete only its pmt space
 			assert(pmt_alloc->deleteSegment(id, sharedSegIds[name][i].second)
 				== Status::OK);
-			//not sharing anymore
+			///not sharing anymore
+			//delete from process structs
+			processes[id].first->sharedSegs.erase(std::find(processes[id].first->sharedSegs.begin(),
+				processes[id].first->sharedSegs.end(),
+				std::make_pair(sharedSegIds[name][i].second, name)));
+			
+			//delete from system structs
 			sharedSegIds[name].erase(it);
 			return Status::OK;
 		}
@@ -175,8 +267,71 @@ Status KernelSystem::pageFault(PMT* pmt, VirtualAddress address)
 	PageNum pg = page(address);
 	//get its descriptor and cluster
 	Descriptor* myDesc = pmt_alloc->getDescriptor(pmt, pg);
+
+	if (apply_cow) {
+		///CoW routine was called
+		apply_cow = false;
+		ClonedDescriptor* cdesc = myDesc->un.clonedDesc;
+		Descriptor* clonedDesc = &(myDesc->un.clonedDesc->desc);
+		ClusterNo new_cluster;
+		char* phyAddress;
+		void* temp = nullptr;
+
+		///copy cloned page to new cluster
+		if (clonedDesc->valid) {
+			//cloned page in memory 
+			unsigned frame = clonedDesc->frame;
+			//get address
+			phyAddress = (char*)processVMSpace + (frame << PAGE_BITS);
+		}
+		else {
+			//cloned page out of memory
+			temp = ::operator new(PAGE_SIZE);
+			ClusterNo clust = clonedDesc->un.cluster;
+			partition->readCluster(clust, (char*)temp);
+			phyAddress = (char*)temp;
+		}
+		//get new cluster
+		if (!pmt_alloc->freeClusters.size())
+			return Status::TRAP;
+		new_cluster = pmt_alloc->freeClusters.front();
+		pmt_alloc->freeClusters.pop();
+		partition->writeCluster(new_cluster, phyAddress);
+		if (temp)
+			delete temp;
+
+
+		///modify myDesc to point on new cluster
+		myDesc->cloned = 0;
+		myDesc->valid = 0;
+		myDesc->ref_thrash = 1;
+		myDesc->ref_clock = 1;
+		myDesc->dirty = 1;
+		myDesc->un.cluster = new_cluster;
+
+		///update cloned descriptor
+		cdesc->numSharing--;
+		if (cdesc->numSharing == 0) {
+			//page not needed anymore
+			if (cdesc->desc.valid)
+				refreshFrame(cdesc->desc.frame);
+			pmt_alloc->freeClusters.push(cdesc->desc.un.cluster);
+
+			pmt_alloc->pvFree[cdesc->pvidx].numFree++;
+			if (pmt_alloc->pvFree[cdesc->pvidx].numFree == CLONED_PAGE_SIZE) {
+				pmt_alloc->pvFree[cdesc->pvidx].cpage = nullptr;
+				pmt_alloc->freePages.push(pmt_alloc->pvFree[cdesc->pvidx].pageNumber);
+			}
+		}
+	}
+
 	if (myDesc->shared)
 		myDesc = myDesc->un.hiddenDesc;
+	if (myDesc->cloned) {
+		myDesc = &(myDesc->un.clonedDesc->desc);
+		//std::cout << myDesc->cloned;
+	}
+	assert(myDesc->cloned == 0);
 	
 	//select frame of page to swap out
 	FrameNum frame = getVictim();
@@ -187,8 +342,10 @@ Status KernelSystem::pageFault(PMT* pmt, VirtualAddress address)
 		if (desc->dirty) {
 			//is dirty
 			desc->dirty = 0; //not dirty anymore
-			//write new version to its cluster 
+			//write new version to its cluster
+			assert(desc->cloned == 0);
 			ClusterNo cluster = desc->un.cluster;
+			//std::cout << desc->cloned;
 			if (!partition->writeCluster(cluster, (char*)getFrameAddress(frame))) {
 				//should not happen
 				std::cout << "PARTITION SAVE FAILED!";

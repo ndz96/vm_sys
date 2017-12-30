@@ -10,6 +10,8 @@
 
 #define PMT_L1_BITS 7 //higher 7 bits
 #define PMT_L2_BITS 7 //lower 7 bits
+#define CLONED_PAGE_BITS 6
+#define CLONED_PAGE_SIZE (1 << CLONED_PAGE_BITS)
 
 #define VALID_POS 31
 #define R_POS 30
@@ -23,9 +25,12 @@
 #define DESC_VALID_POS 22
 
 struct Descriptor;
+struct ClonedDescriptor;
+
 union UN{
 	unsigned cluster; //if standard segment
 	Descriptor* hiddenDesc; //if shared segment
+	ClonedDescriptor* clonedDesc; //if cloned page
 };
 
 struct Descriptor {
@@ -108,6 +113,27 @@ public:
 	unsigned cntChildren[1 << PMT_L1_BITS];
 };
 
+//CoW structs
+
+struct ClonedDescriptor {
+	Descriptor desc;
+	size_t numSharing;
+	unsigned pvidx;
+};
+
+class ClonedPage {
+public:
+	ClonedDescriptor cldesc[CLONED_PAGE_SIZE];
+};
+
+struct PvIndex {
+	PvIndex(ClonedPage* _cpage, unsigned _numFree, unsigned _pageNumber) :cpage(_cpage),
+		numFree(_numFree), pageNumber(_pageNumber) {};
+	ClonedPage* cpage;
+	unsigned numFree;
+	unsigned pageNumber;
+};
+
 class KernelSystem;
 
 class PMTAllocator {
@@ -120,6 +146,7 @@ public:
 						   bool shared, bool cloned, ProcessId hiddenProcessId, VirtualAddress sharedStartAddress);
 	Status deleteSegment(ProcessId id, VirtualAddress startAddress);
 	Descriptor* getDescriptor(PMT* pmt, PageNum pg);
+	ClonedDescriptor* getFreeClonedDescriptor();
 
 	//debug
 	inline unsigned numFreePages() { return freePages.size(); }
@@ -141,4 +168,9 @@ private:
 	std::queue<ClusterNo> freeClusters;
 	std::map<ProcessId, std::vector<std::pair<PageNum, PageNum>>> segments;
 	std::map<ProcessId, PageNum> idpmt_page;
+	
+	//for CoW clone
+	std::vector<PvIndex> pvFree;
+	ClonedPage* allocateClonedPage();
+	friend KernelSystem;
 };

@@ -97,11 +97,14 @@ Status PMTAllocator::allocateSegment(ProcessId id, VirtualAddress startAddress, 
 	}
 
 	//get shared pmt
-	PMT* pmtShared = nullptr;
+	PMT *pmtShared = nullptr, *pmtCloned = nullptr;
 	PageNum sharedPgStart = 0;
 	if (shared) {
 		pmtShared = sys->getPMT(hiddenProcessId);
 		sharedPgStart = page(sharedStartAddress);
+	}
+	if (cloned) {
+		pmtCloned = sys->getPMT(hiddenProcessId);
 	}
 		
 
@@ -121,8 +124,9 @@ Status PMTAllocator::allocateSegment(ProcessId id, VirtualAddress startAddress, 
 		desc->w = (wbit(flags));
 		desc->x = (xbit(flags));
 		desc->shared = shared;
+		desc->cloned = cloned;
 
-		if (!shared) {
+		if (!shared && !cloned) {
 			desc->valid = 0;
 			desc->ref_thrash = 0;
 			desc->ref_clock = 0;
@@ -132,8 +136,12 @@ Status PMTAllocator::allocateSegment(ProcessId id, VirtualAddress startAddress, 
 			freeClusters.pop();
 			desc->un.cluster = cluster;
 		}
-		else
+		else if (shared)
 			desc->un.hiddenDesc = getDescriptor(pmtShared, sharedPgStart + (pg - pgStart));
+		else if (cloned) {
+			desc->un.clonedDesc = getDescriptor(pmtCloned, pg)->un.clonedDesc;
+			desc->un.clonedDesc->numSharing++;
+		}
 	}
 
 	//insert segment into vector
@@ -166,6 +174,23 @@ Status PMTAllocator::deleteSegment(ProcessId id, VirtualAddress startAddress)
 		if (desc == nullptr)
 			std::cout << "deleteSegment :: HUGEERRROR";
 		desc->desc_valid = 0;
+
+		if (desc->cloned) {
+			ClonedDescriptor* cdesc = desc->un.clonedDesc;
+			cdesc->numSharing--;
+			if (cdesc->numSharing == 0) {
+				//page not needed anymore
+				if (cdesc->desc.valid)
+					sys->refreshFrame(cdesc->desc.frame);
+				freeClusters.push(cdesc->desc.un.cluster);
+
+				pvFree[cdesc->pvidx].numFree++;
+				if (pvFree[cdesc->pvidx].numFree == CLONED_PAGE_SIZE) {
+					pvFree[cdesc->pvidx].cpage = nullptr;
+					freePages.push(pvFree[cdesc->pvidx].pageNumber);
+				}
+			}
+		}
 
 		//if not shared descriptor free relevant space
 		if (!desc->shared && !desc->cloned) {
@@ -203,4 +228,42 @@ Descriptor* PMTAllocator::getDescriptor(PMT* pmt, PageNum pg)
 		return nullptr;
 	//all OK
 	return desc;
+}
+
+ClonedDescriptor* PMTAllocator::getFreeClonedDescriptor() {
+	//try to find free between existing used pages
+	for (size_t i = 0; i < pvFree.size(); ++i) {
+		if (pvFree[i].cpage != nullptr && pvFree[i].numFree > 0) {
+			for (size_t j = 0; j < CLONED_PAGE_SIZE; ++j)
+				if (pvFree[i].cpage->cldesc[j].numSharing == 0) {
+					pvFree[i].numFree--;
+					return &pvFree[i].cpage->cldesc[j];
+				}
+		}
+	}
+
+	ClonedPage* cpage = allocateClonedPage();
+	if (cpage == nullptr)
+		return nullptr;
+
+	pvFree[pvFree.size() - 1].numFree--;
+	return &cpage->cldesc[0];
+}
+
+ClonedPage* PMTAllocator::allocateClonedPage()
+{
+	if (freePages.size() == 0)
+		return nullptr;
+	
+	PageNum page = freePages.front();
+	freePages.pop();
+
+	ClonedPage* ret = (ClonedPage*)align_page(page);
+	for (size_t i = 0; i < CLONED_PAGE_SIZE; ++i) {
+		ret->cldesc[i].numSharing = 0;
+		ret->cldesc[i].pvidx = pvFree.size();
+	}
+
+	pvFree.push_back(PvIndex(ret, CLONED_PAGE_SIZE, page));
+	return ret;
 }

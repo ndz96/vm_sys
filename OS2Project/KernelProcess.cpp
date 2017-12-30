@@ -72,6 +72,8 @@ PhysicalAddress KernelProcess::getPhysicalAddress(VirtualAddress address)
 
 	if (desc->shared)
 		desc = desc->un.hiddenDesc;
+	if (desc->cloned)
+		desc = &(desc->un.clonedDesc->desc);
 
 	//not in memory
 	if (!desc->valid)
@@ -129,6 +131,7 @@ Status KernelProcess::createSharedSegment(VirtualAddress startAddress, PageNum s
 	//allocated shared segment successfully -> now points to hidden process
 	//update structs
 	sys->sharedSegIds[name].push_back(std::make_pair(id, startAddress));
+	sharedSegs.push_back(std::make_pair(startAddress, name));
 	return Status::OK;
 }
 

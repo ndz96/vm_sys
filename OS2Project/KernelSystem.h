@@ -76,5 +76,6 @@ private:
 	std::map<std::string, ProcessId> sharedHiddenProcId;
 	std::map<std::string, AccessType> sharedFlags;
 
+	bool apply_cow = false;
 	friend KernelProcess;
 };
