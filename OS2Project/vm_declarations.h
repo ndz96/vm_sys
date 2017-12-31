@@ -18,3 +18,9 @@ typedef unsigned ProcessId;
 #define rbit(type) ((type == READ || type == READ_WRITE) ? 1 : 0)
 #define wbit(type) ((type == WRITE || type == READ_WRITE) ? 1 : 0)
 #define xbit(type) ((type == EXECUTE) ? 1 : 0)
+
+//mode
+//#define NEW_THREAD
+#define DIAGNOSTICS
+#define TIMESTAMP 1
+#define PROBABILITY_AND_STATISTICS

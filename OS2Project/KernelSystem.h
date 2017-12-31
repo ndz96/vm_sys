@@ -11,6 +11,7 @@
 #include <map>
 #include <string>
 #include <algorithm>
+#include <thread>
 
 class PMTAllocator;
 class PMT;
@@ -20,6 +21,7 @@ typedef unsigned FrameNum;
 struct FrameDesc {
 	bool isFree;
 	Descriptor* myDesc;
+	std::mutex mtx;
 	///ProcessId pid; local polytics/thrashing -> for replacement algorithm???
 };
 
@@ -76,6 +78,22 @@ private:
 	std::map<std::string, ProcessId> sharedHiddenProcId;
 	std::map<std::string, AccessType> sharedFlags;
 
+	// CoW
 	bool apply_cow = false;
+
+#ifdef NEW_THREAD
+	// Saver thread
+	unsigned lastAccessedFrame = -1;
+	void startSaverThread();
+	std::thread *saverThread;
+	static void stfunc(KernelSystem* sys);
+	bool end;
+#endif
+
+#ifdef DIAGNOSTICS
+	unsigned pf_load;
+	unsigned pf_save;
+#endif
+
 	friend KernelProcess;
 };

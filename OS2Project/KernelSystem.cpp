@@ -22,11 +22,23 @@ KernelSystem::KernelSystem(PhysicalAddress _processVMSpace, PageNum _processVMSp
 	clockHand = 0;
 	processes_size = 0;
 	processesWrap = processes.data();
+#ifdef NEW_THREAD
+	end = false;
+	startSaverThread();
+#endif
+#ifdef DIAGNOSTICS
+	pf_save = 0;
+	pf_load = 0;
+#endif
 }
 
 KernelSystem::~KernelSystem()
 {
 	std::lock_guard<std::recursive_mutex> lck(mtx);
+#ifdef NEW_THREAD
+	end = true;
+	saverThread->join();
+#endif
 	for (ProcessId id = 0; id < processes.size(); ++id) {
 		if (processes[id].second) {
 			//std::cout << "Proces: " << id << " ostao ziv - unistavam!" << std::endl;
@@ -34,6 +46,11 @@ KernelSystem::~KernelSystem()
 		}
 	}
 	delete pmt_alloc;
+#ifdef DIAGNOSTICS
+	std::cout << std::endl << "DIAGNOSTICS: " << std::endl;
+	std::cout << "PAGE_FAULT_SAVES: " << pf_save << std::endl;
+	std::cout << "PAGE_FAULT_LOADS: " << pf_load << std::endl;
+#endif
 }
 
 Process* KernelSystem::createProcess()
@@ -100,13 +117,26 @@ Status KernelSystem::access(ProcessId pid, VirtualAddress address, AccessType ty
 	//set relevant bits
 	desc->ref_thrash = 1;
 	desc->ref_clock = 1;
-	if (type == AccessType::WRITE || type == AccessType::READ_WRITE)
-		desc->dirty = 1;
-	
+
 	//not in memory
-	if (!desc->valid)
+	if (!desc->valid) {
+		if (type == AccessType::WRITE || type == AccessType::READ_WRITE)
+			desc->dirty = 1;
 		return Status::PAGE_FAULT;
+	}
 	
+
+	if (type == AccessType::WRITE || type == AccessType::READ_WRITE) {
+#ifdef NEW_THREAD
+#ifdef PROBABILITY_AND_STATISTICS
+		std::lock_guard<std::mutex> lk(frames[desc->frame].mtx);
+#endif
+#endif
+		desc->dirty = 1;
+#ifdef NEW_THREAD
+		lastAccessedFrame = desc->frame;
+#endif
+	}
 	return Status::OK;
 }
 
@@ -176,8 +206,15 @@ Process* KernelSystem::cloneProcess(ProcessId pid)
 				cdesc->desc.un.cluster = desc->un.cluster; //just in case for union copyc
 
 				//update frame to point to cloned one
-				if (desc->valid)
+				if (desc->valid) {
+#ifdef NEW_THREAD
+					frames[desc->frame].mtx.lock();
+#endif
 					frames[desc->frame].myDesc = &(cdesc->desc);
+#ifdef NEW_THREAD
+					frames[desc->frame].mtx.unlock();
+#endif
+				}
 
 				//update this one to point to cloned one
 				desc->cloned = 1;
@@ -247,6 +284,40 @@ Status KernelSystem::deleteSharedSegment(const char* _name)
 	sharedFlags.erase(name);
 	return Status::OK;
 }
+
+#ifdef NEW_THREAD
+void KernelSystem::stfunc(KernelSystem* sys) {
+	while (1) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(TIMESTAMP));
+		for (FrameNum fr = 0; fr < sys->processVMSpaceSize; ++fr) {
+			if (sys->end)
+				goto END;
+			sys->frames[fr].mtx.lock();
+			if (!sys->frames[fr].isFree && fr != sys->lastAccessedFrame) {
+				Descriptor* desc = sys->frames[fr].myDesc;
+				if (desc->dirty) {
+					//dirty page -> write to its cluster
+					desc->dirty = 0;
+					ClusterNo cluster = desc->un.cluster;
+					if (!sys->partition->writeCluster(cluster, (char*)sys->getFrameAddress(fr))) {
+						std::cout << "PARTITION SAVE FAILED!";
+						desc->dirty = 1;
+					}
+				}
+			}
+			sys->frames[fr].mtx.unlock();
+		}
+	}
+END:
+	return;
+}
+
+
+void KernelSystem::startSaverThread()
+{
+	saverThread = new std::thread(stfunc, this);
+}
+#endif
 
 PMT* KernelSystem::getPMT(ProcessId id) {
 	if (id < 0 || id >= processes.size())
@@ -335,7 +406,11 @@ Status KernelSystem::pageFault(PMT* pmt, VirtualAddress address)
 	
 	//select frame of page to swap out
 	FrameNum frame = getVictim();
+#ifdef NEW_THREAD
+	lastAccessedFrame = frame;
 
+	frames[frame].mtx.lock();
+#endif
 	if (!frames[frame].isFree) {
 		Descriptor* desc = frames[frame].myDesc;
 		desc->valid = 0; //not in memory anymore
@@ -346,6 +421,9 @@ Status KernelSystem::pageFault(PMT* pmt, VirtualAddress address)
 			assert(desc->cloned == 0);
 			ClusterNo cluster = desc->un.cluster;
 			//std::cout << desc->cloned;
+#ifdef DIAGNOSTICS
+			pf_save++;
+#endif
 			if (!partition->writeCluster(cluster, (char*)getFrameAddress(frame))) {
 				//should not happen
 				std::cout << "PARTITION SAVE FAILED!";
@@ -358,7 +436,9 @@ Status KernelSystem::pageFault(PMT* pmt, VirtualAddress address)
 
 	//load page from address to frame
 	ClusterNo cluster = myDesc->un.cluster;
-
+#ifdef DIAGNOSTICS
+	pf_load++;
+#endif
 	//load page from cluster
 	if (!partition->readCluster(cluster, (char*)getFrameAddress(frame))) {
 		//should not happen
@@ -373,6 +453,9 @@ Status KernelSystem::pageFault(PMT* pmt, VirtualAddress address)
 	//update frame structure
 	frames[frame].isFree = false; //is taken
 	frames[frame].myDesc = myDesc; //point its descriptor
+#ifdef NEW_THREAD
+	frames[frame].mtx.unlock();
+#endif
 	return Status::OK; //all OK, huh
 }
 
@@ -380,11 +463,15 @@ int KernelSystem::findBestCandidate(bool dirty)
 {
 	FrameNum initClockHand = clockHand;
 	do {
+//#ifdef NEW_THREAD
+//		std::lock_guard<std::mutex> lck(frames[clockHand].mtx);
+//#endif
 		if (frames[clockHand].myDesc->dirty == dirty) {
 			if (frames[clockHand].myDesc->ref_clock == false) //found victim
 				return 1;
 			frames[clockHand].myDesc->ref_clock = 0; //reset bit, give second chance
 		}
+
 		clockHand = (clockHand + 1) % processVMSpaceSize;
 	} while (clockHand != initClockHand);
 	return 0; //no corresponding class victims
@@ -398,14 +485,19 @@ PhysicalAddress KernelSystem::getFrameAddress(FrameNum frame)
 void KernelSystem::refreshFrame(FrameNum frame)
 {
 	freeFrames.insert(frame);
+#ifdef NEW_THREAD
+	frames[frame].mtx.lock();
+#endif
 	frames[frame].isFree = true;
+#ifdef NEW_THREAD
+	frames[frame].mtx.unlock();
+#endif
 	return;
 }
 
 Time KernelSystem::periodicJob()
 {
 	std::lock_guard<std::recursive_mutex> lck(mtx);
-	///TO DO
 	return 0;
 }
 
@@ -439,6 +531,14 @@ FrameNum KernelSystem::getVictim() {
 		clockHand = (clockHand + 1) % processVMSpaceSize;
 		return victim;
 	}
+
+#ifdef NEW_THREAD
+	if (findBestCandidate(0)) {
+		victim = clockHand;
+		clockHand = (clockHand + 1) % processVMSpaceSize;
+		return victim;
+	}
+#endif
 	return -1;
 }
 
